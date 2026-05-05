@@ -1,6 +1,10 @@
 #include "mbed.h"
 #include "deque"
 #include "string"
+#include "SDBlockDevice.h"
+#include "FATFileSystem.h"
+#include <cstdio>
+#include <cstring>
 
 //Initialise pins
 DigitalIn col1(PB_12);
@@ -15,6 +19,10 @@ DigitalOut buzzer(PE_10);
 AnalogIn gas(A2);
 AnalogIn pot(A0);
 AnalogIn temp(A1);
+#define SD_MOSI PA_7 // use #define as in/out is already defined in API
+#define SD_MISO PA_6
+#define SD_SCLK PA_5
+#define SD_CS   PD_14
 
 //constant strings used in printing to terminal
 const string POT_NAME = "POTENTIOMETER";
@@ -55,8 +63,11 @@ void RTCConfig() {
     printf("TIME SET: %s", ctime(&seconds));
 }
 
-//communication with board
+//communication with board and SD card
 UnbufferedSerial uartUsb(USBTX, USBRX, 115200);
+SDBlockDevice sd(SD_MOSI, SD_MISO, SD_SCLK, SD_CS);
+FATFileSystem fs("fs");
+#define ALARM_LOG_FILE "/fs/alarm_log.csv" //file is .CSV format to make logs look nice
 
 //define matrix
 char matrixPad[4][4] = {
@@ -94,6 +105,43 @@ typedef struct {
 //deque to manage log events
 deque<logEvent_t> logEvents;
 
+//Function to mount and format the SD card + Set up the log file - note:could get added to init function
+bool sd_init() {
+    if (sd.init() != 0) {
+        printf("init failed\n"); //testing
+        return false;
+    }
+    if (fs.mount(&sd) != 0) {
+        printf("no SD card found\n"); //testing
+        if (FATFileSystem::format(&sd) != 0) {
+            printf("formating failed\n"); //testing
+            return false;
+        }
+        if (fs.mount(&sd) != 0) {
+            printf("failed to mount after formatting\n"); //testing
+            return false;
+        }
+    }
+    // Write headdings for the excel(.CSV) file for time and date and alarm type
+    FILE *f = fopen(ALARM_LOG_FILE, "r");
+    if (f == NULL) {
+        f = fopen(ALARM_LOG_FILE, "w");
+        if (f != NULL) {
+            fprintf(f, "Alarm type, Time and date\n"); //has the colums muddles first time round
+            fclose(f);
+            printf("file setup sucsess\n"); //testing
+        } else {
+            printf("file setup failed\n"); //testing
+            return false;
+        }
+    } else {
+        fclose(f);
+    }
+
+    printf("init sucsess\n"); //testing
+    return true;
+}
+
 //initialise stuff used in code
 void init() {
     col1.mode(PullDown);
@@ -102,6 +150,7 @@ void init() {
     col4.mode(PullDown);
     alarmActive = 0;
     RTCConfig();
+    sd_init();
     printf("\nSYSTEM ACTIVE\n");
 }
 
@@ -230,7 +279,26 @@ string enterPasscode() {
     return passcodeEntered;
 }
 
-//Function to log the most recent 5 alarms
+//log alarms to SD card
+bool sd_log_alarm(const string &warningType, const time_t timestamp) {
+    FILE *f = fopen(ALARM_LOG_FILE, "a");
+    if (f == NULL) {
+        printf("failed printing\n"); //testing
+        return false;
+    }
+    fprintf(f, "\n%s %s\n", warningType.c_str(), ctime(&timestamp));
+    fclose(f);
+    return true;
+}
+
+//function to safley remove card without corruption
+void sd_unmount() {
+    fs.unmount();
+    sd.deinit();
+    printf("safe to remove SD card\n"); //initially testing but could leave in
+}
+
+//Function to log the most recent 5 alarms + lab 8 - also logs to file
 void logAlarms() {
     time_t rawTime;
     time(&rawTime);
@@ -240,11 +308,15 @@ void logAlarms() {
         alarmType = GAS_WARNING;
         newEvent = {GAS_WARNING, time(NULL)};
         logEvents.push_front(newEvent); //ensures newest event is top of list
+        sd_log_alarm(GAS_WARNING, time(&rawTime)); //maybe unmount SC card here?
+        sd_unmount();
     }
     if (tempAlarmActive) {
         alarmType = TEMP_WARNING;
         newEvent = {TEMP_WARNING, time(NULL)};
         logEvents.push_front(newEvent);
+        sd_log_alarm(TEMP_WARNING, time(&rawTime));
+        sd_unmount();
     }
     if (logEvents.size() > MAX_LOGS) {
         logEvents.pop_back(); //'pop' oldest event off the list like it
